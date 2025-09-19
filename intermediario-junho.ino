@@ -1,0 +1,162 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include "FS.h"
+#include "SD_MMC.h"
+
+#define CHANNEL 1
+
+// Controle da imagem
+int currentTransmitCurrentPosition = 0;
+int currentTransmitTotalPackages = 0;
+bool newImageReceived = false;
+
+// Dados do destino (MAC do receptor final) - ATUALIZADO
+uint8_t destinationMac[] = {0xC8, 0xF0, 0x9E, 0x9D, 0x4F, 0xBD};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32 Intermediário - Receiver & Forwarder");
+
+  // Inicializa cartão SD
+  if (!SD_MMC.begin()) {
+    Serial.println("Falha ao montar SD");
+    return;
+  }
+
+  // Configura WiFi como AP+STA
+  WiFi.mode(WIFI_AP_STA);
+  configDeviceAP();
+
+  Serial.print("MAC AP: ");
+  Serial.println(WiFi.softAPmacAddress());
+
+  Serial.print("MAC STA: ");
+  Serial.println(WiFi.macAddress());
+
+  // Inicializa ESP-NOW
+  InitESPNow();
+
+  // Adiciona o destinatário final
+  addPeer(destinationMac);
+
+  // Registra callbacks
+  esp_now_register_recv_cb(OnDataRecv);
+}
+
+void loop() {
+  // Quando recebe a imagem completa
+  if (newImageReceived) {
+    newImageReceived = false;
+    Serial.println("Imagem recebida e retransmitida com sucesso.");
+  }
+}
+
+// Callback de recepção
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int data_len) {
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+           recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+  Serial.printf("Dados recebidos de %s\n", macStr);
+
+  processReceivedData(data, data_len);
+}
+
+// Processamento dos dados
+void processReceivedData(const uint8_t *data, int data_len) {
+  uint8_t header = *data++;
+
+  switch (header) {
+    case 0x01: { // Início da transmissão
+      currentTransmitCurrentPosition = 0;
+      currentTransmitTotalPackages = (*data++) << 8 | *data;
+      Serial.println("Início da transmissão, pacotes esperados: " + String(currentTransmitTotalPackages));
+
+      if (SD_MMC.exists("/received.jpg")) {
+        SD_MMC.remove("/received.jpg");
+      }
+
+      // Retransmitir comando de início
+      uint8_t message[] = {0x01, currentTransmitTotalPackages >> 8, (byte) currentTransmitTotalPackages};
+      sendData(message, sizeof(message));
+      break;
+    }
+
+    case 0x02: { // Dados
+      currentTransmitCurrentPosition = (*data++) << 8 | *data++;
+      Serial.println("Recebendo e retransmitindo chunk: " + String(currentTransmitCurrentPosition));
+
+      { // Bloco adicional para a variável file
+        File file = SD_MMC.open("/received.jpg", FILE_APPEND);
+        if (file) {
+          for (int i = 0; i < (data_len - 3); i++) {
+            file.write(*data++);
+          }
+          file.close();
+        }
+      }
+
+      // Retransmitir chunk
+      uint8_t message[data_len];
+      message[0] = 0x02;
+      message[1] = currentTransmitCurrentPosition >> 8;
+      message[2] = (byte) currentTransmitCurrentPosition;
+      memcpy(&message[3], data - (data_len - 3), data_len - 3);
+
+      sendData(message, sizeof(message));
+
+      if (currentTransmitCurrentPosition == currentTransmitTotalPackages) {
+        newImageReceived = true;
+        Serial.println("Imagem completa recebida e retransmitida.");
+      }
+      break;
+    }
+  }
+}
+
+// Inicializa ESP-NOW
+void InitESPNow() {
+  WiFi.disconnect();
+  if (esp_now_init() == ESP_OK) {
+    Serial.println("ESP-NOW inicializado com sucesso");
+  } else {
+    Serial.println("Erro na inicialização do ESP-NOW");
+    ESP.restart();
+  }
+}
+
+// Configura AP
+void configDeviceAP() {
+  const char *SSID = "Slave";
+  bool result = WiFi.softAP(SSID, "12345678", CHANNEL, 0);
+  if (!result) {
+    Serial.println("Erro ao configurar AP");
+  } else {
+    Serial.println("AP configurado: " + String(SSID));
+  }
+}
+
+// Adiciona peer (destinatário)
+void addPeer(const uint8_t *mac) {
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = CHANNEL;
+  peerInfo.encrypt = 0;
+
+  if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+    Serial.println("Peer adicionado com sucesso");
+  } else {
+    Serial.println("Falha ao adicionar peer");
+  }
+}
+
+// Envia dados
+void sendData(const uint8_t *data, size_t len) {
+  esp_err_t result = esp_now_send(destinationMac, data, len);
+
+  if (result == ESP_OK) {
+    Serial.println("Enviado com sucesso");
+  } else {
+    Serial.println("Erro ao enviar: " + String(result));
+  }
+}
